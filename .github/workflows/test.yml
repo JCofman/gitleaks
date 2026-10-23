@@ -9,32 +9,29 @@ on:
       - "*"
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
-    env:
-      GO111MODULE: on
-    steps:
-    - uses: actions/checkout@v2
-
-    - name: Set up Go
-      uses: actions/setup-go@v2
-      with:
-        go-version: 1.17
-
-    - name: Build
-      run: go build -v ./...
-
   test:
-    runs-on: ubuntu-latest
-    env:
-      GO111MODULE: on
+    strategy:
+      matrix:
+        platform: [ ubuntu-latest, windows-latest ]
+    runs-on: ${{ matrix.platform }}
     steps:
-    - uses: actions/checkout@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-    - name: Set up Go
-      uses: actions/setup-go@v2
-      with:
-        go-version: 1.17
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: 1.25
 
-    - name: Test
-      run: make test
+      - name: Build
+        run: go build ./...
+
+      - name: Set up gotestsum
+        run: |
+          go install gotest.tools/gotestsum@latest
+
+      - name: Test
+        run: |
+          gotestsum --raw-command -- go test -json ./... --race
+
+      - name: Validate Config
+        run: go generate ./... && git diff --exit-code

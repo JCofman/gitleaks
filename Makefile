@@ -1,47 +1,37 @@
-.PHONY: test test-cover build release-builds
+.PHONY: test test-cover failfast profile clean format build
 
-VERSION := `git fetch --tags && git tag | sort -V | tail -1`
 PKG=github.com/zricethezav/gitleaks
-LDFLAGS=-ldflags "-X=github.com/zricethezav/gitleaks/v7/version.Version=$(VERSION)"
-_LDFLAGS="github.com/zricethezav/gitleaks/v7/version.Version=$(VERSION)"
+VERSION := `git fetch --tags && git tag | sort -V | tail -1`
+LDFLAGS=-ldflags "-X=github.com/zricethezav/gitleaks/v8/version.Version=$(VERSION)"
 COVER=--cover --coverprofile=cover.out
 
 test-cover:
-	go test ./... --race $(COVER) $(PKG) -v
+	go test -v ./... --race $(COVER) $(PKG)
 	go tool cover -html=cover.out
 
 format:
 	go fmt ./...
 
-test: format
-	go get golang.org/x/lint/golint
-	go vet ./...
-	golint ./...
-	go test ./... --race $(PKG) -v
+test: config/gitleaks.toml format
+	go test -v ./... --race $(PKG)
 
-build: format
-	golint ./...
-	go vet ./...
+failfast: format
+	go test -failfast ./...
+
+build: config/gitleaks.toml format
 	go mod tidy
 	go build $(LDFLAGS)
 
-release-builds:
-	rm -rf build
-	mkdir build
-	env GOOS="windows" GOARCH="amd64" go build -o "build/gitleaks-windows-amd64.exe" $(LDFLAGS)
-	env GOOS="windows" GOARCH="386" go build -o "build/gitleaks-windows-386.exe" $(LDFLAGS)
-	env GOOS="linux" GOARCH="amd64" go build -o "build/gitleaks-linux-amd64" $(LDFLAGS)
-	env GOOS="linux" GOARCH="arm" go build -o "build/gitleaks-linux-arm" $(LDFLAGS)
-	env GOOS="linux" GOARCH="mips" go build -o "build/gitleaks-linux-mips" $(LDFLAGS)
-	env GOOS="linux" GOARCH="mips" go build -o "build/gitleaks-linux-mips" $(LDFLAGS)
-	env GOOS="darwin" GOARCH="amd64" go build -o "build/gitleaks-darwin-amd64" $(LDFLAGS)
-	env GOOS="darwin" GOARCH="arm64" go build -o "build/gitleaks-darwin-arm64" $(LDFLAGS)
+lint:
+	golangci-lint run
 
-deploy:
-	@echo "$(DOCKER_PASSWORD)" | docker login -u "$(DOCKER_USERNAME)" --password-stdin
-	docker build --build-arg ldflags=$(_LDFLAGS) -f Dockerfile -t zricethezav/gitleaks:latest -t zricethezav/gitleaks:$(VERSION) .
-	echo "Pushing zricethezav/gitleaks:$(VERSION) and zricethezav/gitleaks:latest"
-	docker push zricethezav/gitleaks
+clean:
+	rm -rf profile
+	find . -type f -name '*.got.*' -delete
+	find . -type f -name '*.out' -delete
 
-dockerbuild:
-	docker build --build-arg ldflags=$(_LDFLAGS) -f Dockerfile -t zricethezav/gitleaks:latest -t zricethezav/gitleaks:$(VERSION) .
+profile: build
+	./scripts/profile.sh './gitleaks' '.'
+
+config/gitleaks.toml: $(wildcard cmd/generate/config/**/*)
+	go generate ./...

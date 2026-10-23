@@ -2,322 +2,491 @@ package config
 
 import (
 	_ "embed"
+	"errors"
 	"fmt"
-	"io"
-	"os"
-	"path"
-	"path/filepath"
-	"regexp"
-	"strconv"
+	"sort"
+	"strings"
 
-	"github.com/zricethezav/gitleaks/v7/options"
+	gv "github.com/hashicorp/go-version"
+	"github.com/spf13/viper"
 
-	"github.com/BurntSushi/toml"
-	"github.com/go-git/go-git/v5"
-	log "github.com/sirupsen/logrus"
+	"github.com/zricethezav/gitleaks/v8/logging"
+	"github.com/zricethezav/gitleaks/v8/regexp"
+	"github.com/zricethezav/gitleaks/v8/version"
 )
 
-//go:embed gitleaks.toml
-var DefaultConfig string
+var (
+	//go:embed gitleaks.toml
+	DefaultConfig string
 
-// Config is a composite struct of Rules and Allowlists
-// Each Rule contains a description, regular expression, tags, and allowlists if available
-type Config struct {
-	Rules     []Rule
-	Allowlist AllowList
-}
+	// use to keep track of how many configs we can extend
+	// yea I know, globals bad
+	extendDepth int
+)
 
-// Entropy represents an entropy range
-type Entropy struct {
-	Min   float64
-	Max   float64
-	Group int
-}
+const maxExtendDepth = 2
 
-// TomlAllowList is a struct used in the TomlLoader that loads in allowlists from
-// specific rules or globally at the top level config
-type TomlAllowList struct {
+// ViperConfig is the config struct used by the Viper config package
+// to parse the config file. This struct does not include regular expressions.
+// It is used as an intermediary to convert the Viper config to the Config struct.
+type ViperConfig struct {
+	Title       string
 	Description string
-	Regexes     []string
-	Commits     []string
-	Files       []string
-	Paths       []string
-	Repos       []string
-}
-
-// TomlLoader gets loaded with the values from a gitleaks toml config
-// see the config in config/gitleaks.toml for an example. TomlLoader is used
-// to generate Config values (compiling regexes, etc).
-type TomlLoader struct {
-	AllowList TomlAllowList
-	Rules     []struct {
+	Extend      Extend
+	Rules       []struct {
+		ID          string
 		Description string
-		Regex       string
-		File        string
 		Path        string
-		ReportGroup int
+		Regex       string
+		SecretGroup int
+		Entropy     float64
+		Keywords    []string
 		Tags        []string
-		Entropies   []struct {
-			Min   string
-			Max   string
-			Group string
+
+		// Deprecated: this is a shim for backwards-compatibility.
+		// TODO: Remove this in 9.x.
+		AllowList *viperRuleAllowlist
+
+		Allowlists []*viperRuleAllowlist
+		Required   []*viperRequired
+		SkipReport bool
+	}
+	// Deprecated: this is a shim for backwards-compatibility.
+	// TODO: Remove this in 9.x.
+	AllowList *viperGlobalAllowlist
+
+	Allowlists []*viperGlobalAllowlist
+
+	MinVersion string
+
+	configPath string
+}
+
+type viperRequired struct {
+	ID            string
+	WithinLines   *int `mapstructure:"withinLines"`
+	WithinColumns *int `mapstructure:"withinColumns"`
+}
+
+type viperRuleAllowlist struct {
+	Description string
+	Condition   string
+	Commits     []string
+	Paths       []string
+	RegexTarget string
+	Regexes     []string
+	StopWords   []string
+}
+
+type viperGlobalAllowlist struct {
+	TargetRules        []string
+	viperRuleAllowlist `mapstructure:",squash"`
+}
+
+// Config is a configuration struct that contains rules and an allowlist if present.
+type Config struct {
+	Title       string
+	Extend      Extend
+	Path        string
+	Description string
+	Rules       map[string]Rule
+	Keywords    map[string]struct{}
+	// used to keep sarif results consistent
+	OrderedRules []string
+	Allowlists   []*Allowlist
+	MinVersion   string
+}
+
+// Extend is a struct that allows users to define how they want their
+// configuration extended by other configuration files.
+type Extend struct {
+	Path          string
+	URL           string
+	UseDefault    bool
+	DisabledRules []string
+}
+
+func (vc *ViperConfig) Translate() (Config, error) {
+	var (
+		keywords       = make(map[string]struct{})
+		orderedRules   []string
+		rulesMap       = make(map[string]Rule)
+		ruleAllowlists = make(map[string][]*Allowlist)
+	)
+
+	// Validate individual rules.
+	for _, vr := range vc.Rules {
+		var (
+			pathPat  *regexp.Regexp
+			regexPat *regexp.Regexp
+		)
+		if vr.Path != "" {
+			pathPat = regexp.MustCompile(vr.Path)
 		}
-		AllowList TomlAllowList
+		if vr.Regex != "" {
+			regexPat = regexp.MustCompile(vr.Regex)
+		}
+		if vr.Keywords == nil {
+			vr.Keywords = []string{}
+		} else {
+			for i, k := range vr.Keywords {
+				keyword := strings.ToLower(k)
+				keywords[keyword] = struct{}{}
+				vr.Keywords[i] = keyword
+			}
+		}
+		if vr.Tags == nil {
+			vr.Tags = []string{}
+		}
+		cr := Rule{
+			RuleID:      vr.ID,
+			Description: vr.Description,
+			Regex:       regexPat,
+			SecretGroup: vr.SecretGroup,
+			Entropy:     vr.Entropy,
+			Path:        pathPat,
+			Keywords:    vr.Keywords,
+			Tags:        vr.Tags,
+			SkipReport:  vr.SkipReport,
+		}
+
+		// Parse the rule allowlists, including the older format for backwards compatibility.
+		if vr.AllowList != nil {
+			// TODO: Remove this in v9.
+			if len(vr.Allowlists) > 0 {
+				return Config{}, fmt.Errorf("%s: [rules.allowlist] is deprecated, it cannot be used alongside [[rules.allowlist]]", cr.RuleID)
+			}
+			vr.Allowlists = append(vr.Allowlists, vr.AllowList)
+		}
+		for _, a := range vr.Allowlists {
+			allowlist, err := vc.parseAllowlist(a)
+			if err != nil {
+				return Config{}, fmt.Errorf("%s: [[rules.allowlists]] %w", cr.RuleID, err)
+			}
+			cr.Allowlists = append(cr.Allowlists, allowlist)
+		}
+
+		for _, r := range vr.Required {
+			if r.ID == "" {
+				return Config{}, fmt.Errorf("%s: [[rules.required]] rule ID is empty", cr.RuleID)
+			}
+			requiredRule := Required{
+				RuleID:        r.ID,
+				WithinLines:   r.WithinLines,
+				WithinColumns: r.WithinColumns,
+				// Distance: r.Distance,
+			}
+			cr.RequiredRules = append(cr.RequiredRules, &requiredRule)
+		}
+
+		orderedRules = append(orderedRules, cr.RuleID)
+		rulesMap[cr.RuleID] = cr
 	}
-}
 
-// NewConfig will create a new config struct which contains
-// rules on how gitleaks will proceed with its scan.
-// If no options are passed via cli then NewConfig will return
-// a default config which can be seen in config.go
-func NewConfig(options options.Options) (Config, error) {
-	var cfg Config
-	tomlLoader := TomlLoader{}
+	// after all the rules have been processed, let's ensure the required rules
+	// actually exist.
+	for _, r := range rulesMap {
+		for _, rr := range r.RequiredRules {
+			if _, ok := rulesMap[rr.RuleID]; !ok {
+				return Config{}, fmt.Errorf("%s: [[rules.required]] rule ID '%s' does not exist", r.RuleID, rr.RuleID)
+			}
+		}
+	}
 
-	var err error
-	if options.ConfigPath != "" {
-		_, err = toml.DecodeFile(options.ConfigPath, &tomlLoader)
-		// append a allowlist rule for allowlisting the config
-		tomlLoader.AllowList.Files = append(tomlLoader.AllowList.Files, path.Base(options.ConfigPath))
+	// Assemble the config.
+	c := Config{
+		Title:        vc.Title,
+		Description:  vc.Description,
+		Extend:       vc.Extend,
+		Rules:        rulesMap,
+		Keywords:     keywords,
+		OrderedRules: orderedRules,
+		MinVersion:   vc.MinVersion,
+	}
+
+	if extendDepth > 0 {
+		// annoying hack to set the current config with the extended path
+		// since if extendDepth > 0 we are operating an extended config.
+		c.Path = vc.configPath
 	} else {
-		_, err = toml.Decode(DefaultConfig, &tomlLoader)
-	}
-	if err != nil {
-		return cfg, err
+		// I don't love this
+		c.Path = viper.ConfigFileUsed()
 	}
 
-	cfg, err = tomlLoader.Parse()
-	if err != nil {
-		return cfg, err
+	if err := validateMinVersion(c.MinVersion, c.Path); err != nil {
+		return Config{}, err
 	}
 
-	return cfg, nil
+	// Parse the config allowlists, including the older format for backwards compatibility.
+	if vc.AllowList != nil {
+		// TODO: Remove this in v9.
+		if len(vc.Allowlists) > 0 {
+			return Config{}, errors.New("[allowlist] is deprecated, it cannot be used alongside [[allowlists]]")
+		}
+		vc.Allowlists = append(vc.Allowlists, vc.AllowList)
+	}
+	for _, a := range vc.Allowlists {
+		allowlist, err := vc.parseAllowlist(&a.viperRuleAllowlist)
+		if err != nil {
+			return Config{}, fmt.Errorf("[[allowlists]] %w", err)
+		}
+		// Allowlists with |targetRules| aren't added to the global list.
+		if len(a.TargetRules) > 0 {
+			for _, ruleID := range a.TargetRules {
+				// It's not possible to validate |ruleID| until after extend.
+				ruleAllowlists[ruleID] = append(ruleAllowlists[ruleID], allowlist)
+			}
+		} else {
+			c.Allowlists = append(c.Allowlists, allowlist)
+		}
+	}
+
+	currentExtendDepth := extendDepth
+	if maxExtendDepth != currentExtendDepth {
+		// disallow both usedefault and path from being set
+		if c.Extend.Path != "" && c.Extend.UseDefault {
+			return Config{}, errors.New("unable to load config due to extend.path and extend.useDefault being set")
+		}
+		if c.Extend.UseDefault {
+			if err := c.extendDefault(vc); err != nil {
+				return Config{}, err
+			}
+		} else if c.Extend.Path != "" {
+			if err := c.extendPath(vc); err != nil {
+				return Config{}, err
+			}
+		}
+	}
+
+	// Validate the rules after everything has been assembled (including extended configs).
+	if currentExtendDepth == 0 {
+		for _, rule := range c.Rules {
+			if err := rule.Validate(); err != nil {
+				return Config{}, err
+			}
+		}
+
+		// Populate targeted configs.
+		for ruleID, allowlists := range ruleAllowlists {
+			rule, ok := c.Rules[ruleID]
+			if !ok {
+				return Config{}, fmt.Errorf("[[allowlists]] target rule ID '%s' does not exist", ruleID)
+			}
+			rule.Allowlists = append(rule.Allowlists, allowlists...)
+			c.Rules[ruleID] = rule
+		}
+	}
+
+	return c, nil
 }
 
-// Parse will parse the values set in a TomlLoader and use those values
-// to create compiled regular expressions and rules used in scans
-func (tomlLoader TomlLoader) Parse() (Config, error) {
-	var cfg Config
-	for _, rule := range tomlLoader.Rules {
-		// check and make sure the rule is valid
-		if rule.Regex == "" && rule.Path == "" && rule.File == "" && len(rule.Entropies) == 0 {
-			log.Warnf("Rule %s does not define any actionable data", rule.Description)
+func validateMinVersion(minVer string, configPath string) error {
+	if minVer == "" {
+		logging.Debug().Str("config path", configPath).
+			Msg("no minVersion specified in config... consider adding minVersion to ensure compatibility.")
+		return nil
+	}
+
+	if version.Version == version.DefaultMsg {
+		logging.Debug().
+			Str("required", minVer).
+			Msg("dev build, skipping config version check.")
+		return nil
+	}
+
+	minSemVer, err := gv.NewSemver(minVer)
+	if err != nil {
+		return fmt.Errorf("invalid minVersion '%s': %w", minVer, err)
+	}
+
+	currentSemVer, err := gv.NewSemver(version.Version)
+	if err != nil {
+		return fmt.Errorf("unable to parse current version: %w", err)
+	}
+
+	if currentSemVer.LessThan(minSemVer) {
+		logging.Warn().
+			Str("required", minVer).
+			Str("current", version.Version).
+			Str("config path", configPath).
+			Msg("config requires a newer Gitleaks version...")
+	}
+
+	return nil
+}
+
+func (vc *ViperConfig) parseAllowlist(a *viperRuleAllowlist) (*Allowlist, error) {
+	var matchCondition AllowlistMatchCondition
+	switch strings.ToUpper(a.Condition) {
+	case "AND", "&&":
+		matchCondition = AllowlistMatchAnd
+	case "", "OR", "||":
+		matchCondition = AllowlistMatchOr
+	default:
+		return nil, fmt.Errorf("unknown allowlist |condition| '%s' (expected 'and', 'or')", a.Condition)
+	}
+
+	// Validate the target.
+	regexTarget := a.RegexTarget
+	if regexTarget != "" {
+		switch regexTarget {
+		case "secret":
+			regexTarget = ""
+		case "match", "line":
+			// do nothing
+		default:
+			return nil, fmt.Errorf("unknown allowlist |regexTarget| '%s' (expected 'match', 'line')", regexTarget)
+		}
+	}
+	var allowlistRegexes []*regexp.Regexp
+	for _, a := range a.Regexes {
+		allowlistRegexes = append(allowlistRegexes, regexp.MustCompile(a))
+	}
+	var allowlistPaths []*regexp.Regexp
+	for _, a := range a.Paths {
+		allowlistPaths = append(allowlistPaths, regexp.MustCompile(a))
+	}
+
+	allowlist := &Allowlist{
+		Description:    a.Description,
+		MatchCondition: matchCondition,
+		Commits:        a.Commits,
+		Paths:          allowlistPaths,
+		RegexTarget:    regexTarget,
+		Regexes:        allowlistRegexes,
+		StopWords:      a.StopWords,
+	}
+	if err := allowlist.Validate(); err != nil {
+		return nil, err
+	}
+	return allowlist, nil
+}
+
+func (c *Config) GetOrderedRules() []Rule {
+	var orderedRules []Rule
+	for _, id := range c.OrderedRules {
+		if _, ok := c.Rules[id]; ok {
+			orderedRules = append(orderedRules, c.Rules[id])
+		}
+	}
+	return orderedRules
+}
+
+func (c *Config) extendDefault(parent *ViperConfig) error {
+	extendDepth++
+	viper.SetConfigType("toml")
+	if err := viper.ReadConfig(strings.NewReader(DefaultConfig)); err != nil {
+		return fmt.Errorf("failed to load extended default config, err: %w", err)
+	}
+	defaultViperConfig := ViperConfig{}
+	if err := viper.Unmarshal(&defaultViperConfig); err != nil {
+		return fmt.Errorf("failed to load extended default config, err: %w", err)
+	}
+	cfg, err := defaultViperConfig.Translate()
+	if err != nil {
+		return fmt.Errorf("failed to load extended default config, err: %w", err)
+
+	}
+	logging.Debug().Msg("extending config with default config")
+	c.extend(cfg)
+	return nil
+}
+
+func (c *Config) extendPath(parent *ViperConfig) error {
+	extendDepth++
+	viper.SetConfigFile(c.Extend.Path)
+	if err := viper.ReadInConfig(); err != nil {
+		return fmt.Errorf("failed to load extended config, err: %w", err)
+	}
+	extensionViperConfig := ViperConfig{}
+	if err := viper.Unmarshal(&extensionViperConfig); err != nil {
+		return fmt.Errorf("failed to load extended config, err: %w", err)
+	}
+
+	extensionViperConfig.configPath = c.Extend.Path
+	logging.Debug().Msgf("extending config with %s", c.Extend.Path)
+	cfg, err := extensionViperConfig.Translate()
+	if err != nil {
+		return fmt.Errorf("failed to load extended config, err: %w", err)
+	}
+	c.extend(cfg)
+	return nil
+}
+
+func (c *Config) extendURL() {
+	// TODO
+}
+
+func (c *Config) extend(extensionConfig Config) {
+	// Get config name for helpful log messages.
+	var configName string
+	if c.Extend.Path != "" {
+		configName = c.Extend.Path
+	} else {
+		configName = "default"
+	}
+	// Convert |Config.DisabledRules| into a map for ease of access.
+	disabledRuleIDs := map[string]struct{}{}
+	for _, id := range c.Extend.DisabledRules {
+		if _, ok := extensionConfig.Rules[id]; !ok {
+			logging.Warn().
+				Str("rule-id", id).
+				Str("config", configName).
+				Msg("Disabled rule doesn't exist in extended config.")
+		}
+		disabledRuleIDs[id] = struct{}{}
+	}
+
+	for ruleID, baseRule := range extensionConfig.Rules {
+		// Skip the rule.
+		if _, ok := disabledRuleIDs[ruleID]; ok {
+			logging.Debug().
+				Str("rule-id", ruleID).
+				Str("config", configName).
+				Msg("Ignoring rule from extended config.")
 			continue
 		}
-		re, err := regexp.Compile(rule.Regex)
-		if err != nil {
-			return cfg, fmt.Errorf("problem loading config: %v", err)
-		}
-		fileNameRe, err := regexp.Compile(rule.File)
-		if err != nil {
-			return cfg, fmt.Errorf("problem loading config: %v", err)
-		}
-		filePathRe, err := regexp.Compile(rule.Path)
-		if err != nil {
-			return cfg, fmt.Errorf("problem loading config: %v", err)
-		}
 
-		// rule specific allowlists
-		var allowList AllowList
-
-		allowList.Description = rule.AllowList.Description
-
-		// rule specific regexes
-		for _, re := range rule.AllowList.Regexes {
-			allowListedRegex, err := regexp.Compile(re)
-			if err != nil {
-				return cfg, fmt.Errorf("problem loading config: %v", err)
+		currentRule, ok := c.Rules[ruleID]
+		if !ok {
+			// Rule doesn't exist, add it to the config.
+			c.Rules[ruleID] = baseRule
+			for _, k := range baseRule.Keywords {
+				c.Keywords[k] = struct{}{}
 			}
-			allowList.Regexes = append(allowList.Regexes, allowListedRegex)
-		}
-
-		// rule specific filenames
-		for _, re := range rule.AllowList.Files {
-			allowListedRegex, err := regexp.Compile(re)
-			if err != nil {
-				return cfg, fmt.Errorf("problem loading config: %v", err)
+			c.OrderedRules = append(c.OrderedRules, ruleID)
+		} else {
+			// Rule exists, merge our changes into the base.
+			if currentRule.Description != "" {
+				baseRule.Description = currentRule.Description
 			}
-			allowList.Files = append(allowList.Files, allowListedRegex)
-		}
-
-		// rule specific paths
-		for _, re := range rule.AllowList.Paths {
-			allowListedRegex, err := regexp.Compile(re)
-			if err != nil {
-				return cfg, fmt.Errorf("problem loading config: %v", err)
+			if currentRule.Entropy != 0 {
+				baseRule.Entropy = currentRule.Entropy
 			}
-			allowList.Paths = append(allowList.Paths, allowListedRegex)
-		}
-
-		// rule specific commits
-		allowList.Commits = rule.AllowList.Commits
-
-		var entropies []Entropy
-		for _, e := range rule.Entropies {
-			min, err := strconv.ParseFloat(e.Min, 64)
-			if err != nil {
-				return cfg, err
+			if currentRule.SecretGroup != 0 {
+				baseRule.SecretGroup = currentRule.SecretGroup
 			}
-			max, err := strconv.ParseFloat(e.Max, 64)
-			if err != nil {
-				return cfg, err
+			if currentRule.Regex != nil {
+				baseRule.Regex = currentRule.Regex
 			}
-			if e.Group == "" {
-				e.Group = "0"
+			if currentRule.Path != nil {
+				baseRule.Path = currentRule.Path
 			}
-			group, err := strconv.ParseInt(e.Group, 10, 64)
-			if err != nil {
-				return cfg, err
-			} else if int(group) >= len(re.SubexpNames()) {
-				return cfg, fmt.Errorf("problem loading config: group cannot be higher than number of groups in regexp")
-			} else if group < 0 {
-				return cfg, fmt.Errorf("problem loading config: group cannot be lower than 0")
-			} else if min > 8.0 || min < 0.0 || max > 8.0 || max < 0.0 {
-				return cfg, fmt.Errorf("problem loading config: invalid entropy ranges, must be within 0.0-8.0")
-			} else if min > max {
-				return cfg, fmt.Errorf("problem loading config: entropy Min value cannot be higher than Max value")
+			baseRule.Tags = append(baseRule.Tags, currentRule.Tags...)
+			baseRule.Keywords = append(baseRule.Keywords, currentRule.Keywords...)
+			baseRule.Allowlists = append(baseRule.Allowlists, currentRule.Allowlists...)
+			// The keywords from the base rule and the extended rule must be merged into the global keywords list
+			for _, k := range baseRule.Keywords {
+				c.Keywords[k] = struct{}{}
 			}
-
-			entropies = append(entropies, Entropy{Min: min, Max: max, Group: int(group)})
+			c.Rules[ruleID] = baseRule
 		}
-
-		r := Rule{
-			Description: rule.Description,
-			Regex:       re,
-			File:        fileNameRe,
-			Path:        filePathRe,
-			ReportGroup: rule.ReportGroup,
-			Tags:        rule.Tags,
-			AllowList:   allowList,
-			Entropies:   entropies,
-		}
-
-		cfg.Rules = append(cfg.Rules, r)
 	}
 
-	// global regex allowLists
-	for _, allowListRegex := range tomlLoader.AllowList.Regexes {
-		re, err := regexp.Compile(allowListRegex)
-		if err != nil {
-			return cfg, fmt.Errorf("problem loading config: %v", err)
-		}
-		cfg.Allowlist.Regexes = append(cfg.Allowlist.Regexes, re)
-	}
+	// append allowlists, not attempting to merge
+	c.Allowlists = append(c.Allowlists, extensionConfig.Allowlists...)
 
-	// global file name allowLists
-	for _, allowListFileName := range tomlLoader.AllowList.Files {
-		re, err := regexp.Compile(allowListFileName)
-		if err != nil {
-			return cfg, fmt.Errorf("problem loading config: %v", err)
-		}
-		cfg.Allowlist.Files = append(cfg.Allowlist.Files, re)
-	}
-
-	// global file path allowLists
-	for _, allowListFilePath := range tomlLoader.AllowList.Paths {
-		re, err := regexp.Compile(allowListFilePath)
-		if err != nil {
-			return cfg, fmt.Errorf("problem loading config: %v", err)
-		}
-		cfg.Allowlist.Paths = append(cfg.Allowlist.Paths, re)
-	}
-
-	// global repo allowLists
-	for _, allowListRepo := range tomlLoader.AllowList.Repos {
-		re, err := regexp.Compile(allowListRepo)
-		if err != nil {
-			return cfg, fmt.Errorf("problem loading config: %v", err)
-		}
-		cfg.Allowlist.Repos = append(cfg.Allowlist.Repos, re)
-	}
-
-	cfg.Allowlist.Commits = tomlLoader.AllowList.Commits
-	cfg.Allowlist.Description = tomlLoader.AllowList.Description
-
-	return cfg, nil
-}
-
-// LoadRepoConfig accepts a repo and config path related to the target repo's root.
-func LoadRepoConfig(repo *git.Repository, repoConfig string) (Config, error) {
-	gitRepoConfig, err := repo.Config()
-	if err != nil {
-		return Config{}, err
-	}
-	if !gitRepoConfig.Core.IsBare {
-		wt, err := repo.Worktree()
-		if err != nil {
-			return Config{}, err
-		}
-		_, err = wt.Filesystem.Stat(repoConfig)
-		if err != nil {
-			return Config{}, err
-		}
-		r, err := wt.Filesystem.Open(repoConfig)
-		if err != nil {
-			return Config{}, err
-		}
-		return parseTomlFile(r)
-	}
-
-	log.Debug("attempting to load repo config from bare worktree, this may use an old config")
-	ref, err := repo.Head()
-	if err != nil {
-		return Config{}, err
-	}
-
-	c, err := repo.CommitObject(ref.Hash())
-	if err != nil {
-		return Config{}, err
-	}
-
-	f, err := c.File(repoConfig)
-	if err != nil {
-		return Config{}, err
-	}
-
-	r, err := f.Reader()
-
-	if err != nil {
-		return Config{}, err
-	}
-
-	return parseTomlFile(r)
-}
-
-// LoadAdditionalConfig Accepts a path to a gitleaks config and returns a Config struct
-func LoadAdditionalConfig(repoConfig string) (Config, error) {
-	file, err := os.Open(filepath.Clean(repoConfig))
-	if err != nil {
-		return Config{}, err
-	}
-
-	return parseTomlFile(file)
-}
-
-// AppendConfig Accepts a Config struct and will append those fields to this Config Struct's fields
-func (config *Config) AppendConfig(configToBeAppended Config) Config {
-	newAllowList := AllowList{
-		Description: "Appended Configuration",
-		Commits:     append(config.Allowlist.Commits, configToBeAppended.Allowlist.Commits...),
-		Files:       append(config.Allowlist.Files, configToBeAppended.Allowlist.Files...),
-		Paths:       append(config.Allowlist.Paths, configToBeAppended.Allowlist.Paths...),
-		Regexes:     append(config.Allowlist.Regexes, configToBeAppended.Allowlist.Regexes...),
-		Repos:       append(config.Allowlist.Repos, configToBeAppended.Allowlist.Repos...),
-	}
-
-	return Config{
-		Rules:     append(config.Rules, configToBeAppended.Rules...),
-		Allowlist: newAllowList,
-	}
-}
-
-// takes a File, makes sure it is a valid config, and parses it
-func parseTomlFile(f io.Reader) (Config, error) {
-	var tomlLoader TomlLoader
-	_, err := toml.DecodeReader(f, &tomlLoader)
-	if err != nil {
-		log.Errorf("Unable to read gitleaks config. Using defaults. Error: %s", err)
-		return Config{}, err
-	}
-	return tomlLoader.Parse()
+	// sort to keep extended rules in order
+	sort.Strings(c.OrderedRules)
+	return
 }

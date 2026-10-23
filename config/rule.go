@@ -1,189 +1,107 @@
 package config
 
 import (
-	"math"
-	"path/filepath"
-	"regexp"
+	"errors"
+	"fmt"
+	"strings"
+
+	"github.com/zricethezav/gitleaks/v8/regexp"
 )
 
-// Offender is a struct that contains the information matched when searching
-// content and information on why it matched (i.e. the EntropyLevel)
-type Offender struct {
-	Match        string
-	EntropyLevel float64
-}
-
-// IsEmpty checks to see if nothing was found in the match
-func (o *Offender) IsEmpty() bool {
-	return o.Match == ""
-}
-
-// ToString the contents of the match
-func (o *Offender) ToString() string {
-	return o.Match
-}
-
-// Rule is a struct that contains information that is loaded from a gitleaks config.
-// This struct is used in the Config struct as an array of Rules and is iterated
-// over during an scan. Each rule will be checked. If a regex match is found AND
-// that match is not allowlisted (globally or locally), then a leak will be appended
-// to the final scan report.
+// Rules contain information that define details on how to detect secrets
 type Rule struct {
+	// RuleID is a unique identifier for this rule
+	RuleID string
+
+	// Description is the description of the rule.
 	Description string
-	Regex       *regexp.Regexp
-	File        *regexp.Regexp
-	Path        *regexp.Regexp
-	ReportGroup int
-	Tags        []string
-	AllowList   AllowList
-	Entropies   []Entropy
+
+	// Entropy is a float representing the minimum shannon
+	// entropy a regex group must have to be considered a secret.
+	Entropy float64
+
+	// SecretGroup is an int used to extract secret from regex
+	// match and used as the group that will have its entropy
+	// checked if `entropy` is set.
+	SecretGroup int
+
+	// Regex is a golang regular expression used to detect secrets.
+	Regex *regexp.Regexp
+
+	// Path is a golang regular expression used to
+	// filter secrets by path
+	Path *regexp.Regexp
+
+	// Tags is an array of strings used for metadata
+	// and reporting purposes.
+	Tags []string
+
+	// Keywords are used for pre-regex check filtering. Rules that contain
+	// keywords will perform a quick string compare check to make sure the
+	// keyword(s) are in the content being scanned.
+	Keywords []string
+
+	// Allowlists allows a rule to be ignored for specific commits, paths, regexes, and/or stopwords.
+	Allowlists []*Allowlist
+
+	// validated is an internal flag to track whether `Validate()` has been called.
+	validated bool
+
+	// If a rule has RequiredRules, it makes the rule dependent on the RequiredRules.
+	// In otherwords, this rule is now a composite rule.
+	RequiredRules []*Required
+
+	SkipReport bool
 }
 
-// Inspect checks the content of a line for a leak
-func (r *Rule) Inspect(line string) *Offender {
-	match := r.Regex.FindString(line)
+type Required struct {
+	RuleID        string
+	WithinLines   *int
+	WithinColumns *int
+}
 
-	// EntropyLevel -1 means not checked
-	if match == "" {
-		return &Offender{
-			Match:        "",
-			EntropyLevel: -1,
+// Validate guards against common misconfigurations.
+func (r *Rule) Validate() error {
+	if r.validated {
+		return nil
+	}
+
+	// Ensure |id| is present.
+	if strings.TrimSpace(r.RuleID) == "" {
+		// Try to provide helpful context, since |id| is empty.
+		var sb strings.Builder
+		if r.Description != "" {
+			sb.WriteString(", description: " + r.Description)
+		}
+		if r.Regex != nil {
+			sb.WriteString(", regex: " + r.Regex.String())
+		}
+		if r.Path != nil {
+			sb.WriteString(", path: " + r.Path.String())
+		}
+		return errors.New("rule |id| is missing or empty" + sb.String())
+	}
+
+	// Ensure the rule actually matches something.
+	if r.Regex == nil && r.Path == nil {
+		return errors.New(r.RuleID + ": both |regex| and |path| are empty, this rule will have no effect")
+	}
+
+	// Ensure |secretGroup| works.
+	if r.Regex != nil && r.SecretGroup > r.Regex.NumSubexp() {
+		return fmt.Errorf("%s: invalid regex secret group %d, max regex secret group %d", r.RuleID, r.SecretGroup, r.Regex.NumSubexp())
+	}
+
+	for _, allowlist := range r.Allowlists {
+		// This will probably never happen.
+		if allowlist == nil {
+			continue
+		}
+		if err := allowlist.Validate(); err != nil {
+			return fmt.Errorf("%s: %w", r.RuleID, err)
 		}
 	}
 
-	// check if offender is allowed
-	// EntropyLevel -1 means not checked
-	if r.RegexAllowed(line) {
-		return &Offender{
-			Match:        "",
-			EntropyLevel: -1,
-		}
-	}
-
-	// check entropy
-	groups := r.Regex.FindStringSubmatch(match)
-	entropyWithinRange, entropyLevel := r.CheckEntropy(groups)
-
-	if len(r.Entropies) != 0 && !entropyWithinRange {
-		return &Offender{
-			Match:        "",
-			EntropyLevel: entropyLevel,
-		}
-	}
-
-	// 0 is a match for the full regex pattern
-	if 0 < r.ReportGroup && r.ReportGroup < len(groups) {
-		match = groups[r.ReportGroup]
-	}
-
-	return &Offender{
-		Match:        match,
-		EntropyLevel: entropyLevel,
-	}
-}
-
-// RegexAllowed checks if the content is allowlisted
-func (r *Rule) RegexAllowed(content string) bool {
-	return anyRegexMatch(content, r.AllowList.Regexes)
-}
-
-// CommitAllowed checks if a commit is allowlisted
-func (r *Rule) CommitAllowed(commit string) bool {
-	return r.AllowList.CommitAllowed(commit)
-}
-
-// CheckEntropy checks if there is an entropy leak
-func (r *Rule) CheckEntropy(groups []string) (bool, float64) {
-	var highestFound float64 = 0
-
-	for _, e := range r.Entropies {
-		if len(groups) > e.Group {
-			entropy := shannonEntropy(groups[e.Group])
-			if entropy >= e.Min && entropy <= e.Max {
-				return true, entropy
-			} else if entropy > highestFound {
-				highestFound = entropy
-			}
-		}
-	}
-
-	if len(r.Entropies) == 0 {
-		// entropies not checked
-		return false, -1
-	}
-
-	// entropies checked but not within the range
-	return false, highestFound
-}
-
-// HasFileOrPathLeakOnly first checks if there are no entropy/regex rules, then checks if
-// there are any file/path leaks
-func (r *Rule) HasFileOrPathLeakOnly(filePath string) bool {
-	if r.Regex.String() != "" {
-		return false
-	}
-	if len(r.Entropies) != 0 {
-		return false
-	}
-	if r.AllowList.FileAllowed(filepath.Base(filePath)) || r.AllowList.PathAllowed(filePath) {
-		return false
-	}
-	return r.HasFileLeak(filepath.Base(filePath)) || r.HasFilePathLeak(filePath)
-}
-
-// HasFileLeak checks if there is a file leak
-func (r *Rule) HasFileLeak(fileName string) bool {
-	return regexMatched(fileName, r.File)
-}
-
-// HasFilePathLeak checks if there is a path leak
-func (r *Rule) HasFilePathLeak(filePath string) bool {
-	return regexMatched(filePath, r.Path)
-}
-
-// shannonEntropy calculates the entropy of data using the formula defined here:
-// https://en.wiktionary.org/wiki/Shannon_entropy
-// Another way to think about what this is doing is calculating the number of bits
-// needed to on average encode the data. So, the higher the entropy, the more random the data, the
-// more bits needed to encode that data.
-func shannonEntropy(data string) (entropy float64) {
-	if data == "" {
-		return 0
-	}
-
-	charCounts := make(map[rune]int)
-	for _, char := range data {
-		charCounts[char]++
-	}
-
-	invLength := 1.0 / float64(len(data))
-	for _, count := range charCounts {
-		freq := float64(count) * invLength
-		entropy -= freq * math.Log2(freq)
-	}
-
-	return entropy
-}
-
-// regexMatched matched an interface to a regular expression. The interface f can
-// be a string type or go-git *object.File type.
-func regexMatched(f string, re *regexp.Regexp) bool {
-	if re == nil {
-		return false
-	}
-	if re.FindString(f) != "" {
-		return true
-	}
-	return false
-}
-
-// anyRegexMatch matched an interface to a regular expression. The interface f can
-// be a string type or go-git *object.File type.
-func anyRegexMatch(f string, res []*regexp.Regexp) bool {
-	for _, re := range res {
-		if regexMatched(f, re) {
-			return true
-		}
-	}
-	return false
+	r.validated = true
+	return nil
 }
